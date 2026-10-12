@@ -91,7 +91,7 @@ static struct {
     uint16_t cur;
     /* input */
     uint8_t oct_down, oct_both;             /* OCT- / OCT+ held (bits 0, 1); both were down in this press */
-    uint32_t both_t0;                       /* when both went down (0: not both): held 5 s, UBOOT as outside */
+    uint32_t both_t0;                       /* when both went down (0: not both): held 10 s, UBOOT as outside */
     uint8_t drawn_cat;                      /* the grid as drawn (another category: cleared first) */
     uint32_t prev_btn, prev_notes;
     /* messages */

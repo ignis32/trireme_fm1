@@ -221,7 +221,7 @@ static void cfg_loaded(void)
 #define EVQ_N 32u                           /* events waiting in a pipeline stage */
 #define POS_COMBO 0x80u                     /* an event's pos for a combo's output: POS_COMBO + combo index */
 #define CHORD_MS 100u                       /* OCT- and OCT+ this close: the chord, not two keys */
-#define CHORD_UBOOT_MS 5000u                /* the chord held this long: UBOOT */
+#define CHORD_UBOOT_MS 10000u               /* the chord held this long: UBOOT (well past the 2 s Vial unlock) */
 enum { CH_IDLE, CH_PEND, CH_FWD, CH_CHORD };
 #define LS_N 8u                             /* temporary layers on at once */
 #define POS_NONE 0xFFu                      /* an action from no control (a knob, a macro, a combo, a tap dance) */
@@ -295,9 +295,9 @@ static struct {
 
 /* Vial security, locked at power-on. Unlocking: the host starts it, then OCT- + OCT+ held UNLOCK_HOLD_MS without a
  * break (our clock, not vial.c's 50 polls >= 100 ms apart: 10 s at the app's 200 ms polling). The counter Vial reads
- * is the time left in tenths of a second (30 .. 0): the app's progress bar takes the largest it saw as its maximum,
+ * is the time left in tenths of a second (20 .. 0): the app's progress bar takes the largest it saw as its maximum,
  * so it fills in step. */
-#define UNLOCK_HOLD_MS 3000u
+#define UNLOCK_HOLD_MS 2000u
 static struct {
     uint8_t unlocked, in_progress;
     uint32_t hold_t0;                       /* when both keys went down (0: not both held) */

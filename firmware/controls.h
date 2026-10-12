@@ -11,7 +11,7 @@
  * assignable, as Vial encoders 0..3 ("knobs"), direction 0 CCW, 1 CW. MASTER (the pot) is not in Vial.
  *
  * Fixed in firmware, never assignable: SELECT, ALGORITHM, PRESETS (layer -/+), OCT- / OCT+ (OCT+: the editor;
- * together, held 5 s: UBOOT). OCT- / OCT+ stay in Vial's matrix because they are the unlock keys; what Vial stores
+ * together, held 10 s: UBOOT). OCT- / OCT+ stay in Vial's matrix because they are the unlock keys; what Vial stores
  * there is ignored (the defaults name their fixed job).
  *
  * Layers: KB_LAYERS of them, all alike (no hidden layers): PRESETS switches between them (cfg.layer, "the base"),

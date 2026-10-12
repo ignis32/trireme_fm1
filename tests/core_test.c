@@ -314,7 +314,7 @@ static void test_chord(void)
     btn = 0;
     step(5);
     CHECK(kb.editor_req == 2, "OCT+ held: editor once (%u)", kb.editor_req);
-    /* the chord, tapped: nothing; held 5 s: UBOOT */
+    /* the chord, tapped: nothing; held 10 s: UBOOT */
     t_uboot = 0;
     btn = NB(0);
     step(30);
@@ -324,11 +324,11 @@ static void test_chord(void)
     step(5);
     CHECK(kb.editor_req == 2 && !t_uboot, "chord tap: nothing (editor %u)", kb.editor_req);
     btn = NB(0) | NB(1);
-    for (i = 0; i < 49u; i++)
+    for (i = 0; i < 99u; i++)
         step(100);
-    CHECK(!t_uboot, "chord 4.9 s: not yet");
+    CHECK(!t_uboot, "chord 9.9 s: not yet");
     step(200);
-    CHECK(t_uboot, "chord 5 s: UBOOT");
+    CHECK(t_uboot, "chord 10 s: UBOOT");
     btn = 0;
     step(5);
     /* OCT positions in the keymap are ignored: a keycode there does nothing */
@@ -425,7 +425,7 @@ static void test_vial(void)
     cmd(m, 0x04, 0, 2, 0);
     vial_cmd(m);
     CHECK(m[0] == 0x04 && m[4] == 0, "during unlock: other requests come back unchanged");
-    /* 3 s held, our clock (polls every 200 ms, as the Vial app): the counter reports tenths left; a release resets */
+    /* 2 s held, our clock (polls every 200 ms, as the Vial app): the counter reports tenths left; a release resets */
     btn = NB(0) | NB(1);
     {
         uint32_t t0 = t_ms, first = 0, last = 99;
@@ -434,7 +434,7 @@ static void test_vial(void)
             kb_input(btn, 0, 0, 0, NOENC);
             if (i == 20u) {                 /* let go for a moment at 1 s: starts again */
                 kb_input(0, 0, 0, 0, NOENC);
-                CHECK(unlock_counter() == 30u, "released: counter back to 30 (%u)", unlock_counter());
+                CHECK(unlock_counter() == 20u, "released: counter back to 20 (%u)", unlock_counter());
                 t0 = t_ms;
                 kb_input(btn, 0, 0, 0, NOENC);
             }
@@ -447,8 +447,8 @@ static void test_vial(void)
             }
         }
         CHECK(vl.unlocked && !vl.in_progress, "unlocked");
-        CHECK(t_ms - t0 >= 3000u && t_ms - t0 <= 3050u, "unlock took %u ms after the last press", t_ms - t0);
-        CHECK(first >= 29u && first <= 30u && last <= 2u, "counter %u .. %u", first, last);
+        CHECK(t_ms - t0 >= 2000u && t_ms - t0 <= 2050u, "unlock took %u ms after the last press", t_ms - t0);
+        CHECK(first >= 19u && first <= 20u && last <= 2u, "counter %u .. %u", first, last);
     }
     btn = 0;
     kb_input(0, 0, 0, 0, NOENC);

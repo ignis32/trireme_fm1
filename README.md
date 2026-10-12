@@ -1,5 +1,9 @@
 # Trireme FM-1
 
+> [!WARNING]
+> **This firmware is vibe-coded**: it was written with an AI coding assistant. I use it on my own FM-1, but I have
+> not been able to test every function by hand. Expect rough edges, and keep the stock firmware at hand.
+
 Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard and macro pad, configured with
 [Vial](https://get.vial.today/) or directly on the device.
 
@@ -50,8 +54,11 @@ Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard 
 
 Install the stock V15 package the same way. The keyboard configuration stays in flash, untouched, for the next time.
 
+The method I actually use to get back to stock reliably is the installer on
+[Baud Girl's website](https://baudgirl.com/work/FM-1+VA/install) (Chrome or Edge).
+
 If the firmware ever does not start: hold **OCT+** while powering on (or hold **OCT-** and **OCT+** together for
-5 seconds while it runs). The FM-1 enters update mode and accepts any firmware package. After two failed starts in
+10 seconds while it runs). The FM-1 enters update mode and accepts any firmware package. After two failed starts in
 a row it enters update mode by itself.
 
 ## The controls
@@ -67,8 +74,8 @@ a row it enters update mode by itself.
 | PRESETS | Switches the layer (0-4) |
 | SELECT | Flips the legend between the buttons and knobs page and the note keys page |
 | OCT+ | Opens the editor |
-| OCT- + OCT+ held 3 s | Unlocks Vial, when Vial asks |
-| OCT- + OCT+ held 5 s | Update mode |
+| OCT- + OCT+ held 2 s | Unlocks Vial, when Vial asks |
+| OCT- + OCT+ held 10 s | Update mode |
 | OCT- held at power-on | MIDI only: no keyboard on USB |
 | OCT+ held at power-on | Update mode |
 
@@ -95,7 +102,7 @@ connected. It finds **FM-1 Keyboard** and shows its layout. Everything is saved 
 last change.
 
 To change macros (or assign the bootloader key), Vial asks to unlock the keyboard: hold **OCT-** and **OCT+**
-together for 3 seconds (a bar fills on the screen).
+together for 2 seconds (a bar fills on the screen).
 
 <img src="docs/images/normal_unlock.png" width="240" alt="Unlocking Vial: hold OCT- and OCT+">
 
@@ -210,6 +217,12 @@ vial-gui's own protocol code.
 ## Licence and credits
 
 GPL-3.0 ([LICENSE](LICENSE)). The firmware includes felucca-bsp's `usb.c`, which is GPL-3.0-only.
+
+**felucca-bsp's licensing is not final.** It is being split out of Felucca, and its own
+[LICENSING.md](https://github.com/hugelton/felucca-bsp/blob/main/LICENSING.md) says the licences are provisional
+until every contributor involved has answered. The intended licences are MPL-2.0 for most files and GPL-3.0-only for
+`usb.c`. This firmware is GPL-3.0 as a whole, which fits either outcome, but the state of felucca-bsp's files may
+change.
 
 - [felucca-bsp](https://github.com/hugelton/felucca-bsp) by Leo Kuroshita / Hügelton Instruments (MPL-2.0, `usb.c`
   GPL-3.0-only), split out of [Felucca](https://github.com/hugelton/Felucca): chip and board support, the update

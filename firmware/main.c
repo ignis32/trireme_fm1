@@ -12,7 +12,7 @@
  *     LEDs, the updater
  *   - updates: the standard M-UPGRADE entry of chip/ota.c (fm1_install.py, web installers, the official updater)
  * Fixed in firmware (kbcore.c): PRESETS switches the layer, OCT+ opens the editor (editor.c), OCT- + OCT+ held
- * 5 s: UBOOT; SELECT / ALGORITHM: the UI's. At power-on: OCT- held, no keyboard on USB (MIDI only,
+ * 10 s: UBOOT; SELECT / ALGORITHM: the UI's. At power-on: OCT- held, no keyboard on USB (MIDI only,
  * upstream's descriptors); OCT+ held, UBOOT. Two failed boots: UBOOT. */
 #include <stdint.h>
 /* Two flavours (Makefile): KB_CONSOLE=1 the USB serial console (EP2 + EP3); 0 (default) raw HID on EP3 instead,
