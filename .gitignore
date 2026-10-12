@@ -1,0 +1,20 @@
+# build output: firmware images and packages go to GitHub releases, never into git
+/build/
+*.o
+*.elf
+*.bin
+*.fwsc
+*.so
+*.ppm
+__pycache__/
+*.pyc
+
+# local Python environment (make test creates it)
+/.venv/
+
+# local paths for the Makefile (TC, AC79_SDK)
+/local.mk
+
+# internal notes, design drafts and reference material: not published
+/internal/
+/refs/

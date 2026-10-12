@@ -1,0 +1,822 @@
+--- a/chip/usb.c
++++ b/chip/usb.c
+@@ -21,7 +21,21 @@
+  * FELUCCA_UAC_48K=1 (the default with FELUCCA_UAC) offers 48 kHz too: the host picks the rate with
+  * SET_CUR (UAC1 sampling frequency control, two discrete rates in the one alt setting). The engines stay
+  * at 44.1 kHz; at 48 kHz uac_tap resamples (polyphase FIR 160 / 147, uac_fir.h) into the ring. 44.1 kHz,
+- * the rate until a host asks for another, sends the samples as before, bit for bit. */
++ * the rate until a host asks for another, sends the samples as before, bit for bit.
++ * FELUCCA_HID=1 (fm1_keyboard) adds a HID keyboard interface, last in the configuration: boot subclass and
++ * protocol, the 8-byte boot report (modifiers, reserved, 6 keys; no report ID), the LED output report through
++ * SET_REPORT on EP0, an interrupt IN endpoint FELUCCA_HID_EP (4 by default: free without the audio input; 2 needs
++ * FELUCCA_CDC=0). MUSB sets an interrupt IN endpoint up as a bulk one: only ISO has a TXCSR bit (Linux
++ * musb_gadget.c). The main loop queues reports (hid_push); usb_poll sends one per USB frame at most.
++ * usb_hid_on (FELUCCA_HID_DEFAULT at boot; usb_hid_switch re-enumerates) 0 presents the device without it,
++ * byte for byte as a FELUCCA_HID=0 build. bcdDevice 4.xx with HID, so a host never mixes the two up.
++ * FELUCCA_RAWHID=1 (with FELUCCA_HID, without FELUCCA_CDC) adds a second HID interface after the keyboard: QMK's
++ * raw HID as VIA and Vial expect it (usage page 0xFF60, usage 0x61, 32-byte input and output reports, no report
++ * ID) on EP FELUCCA_RAWHID_EP (3: the console's bulk pair) IN + OUT, interrupt. One report each way is held:
++ * raw_take (main loop) frees the OUT side, raw_send queues the IN side; a host write may also come as SET_REPORT.
++ * FELUCCA_MEDIA=1 (with FELUCCA_RAWHID) adds a third HID interface, last: mouse (report ID 1: 8 buttons, X, Y,
++ * wheel, pan), system control (ID 2: power, sleep, wake) and consumer control (ID 3: volume, media, browser keys),
++ * QMK's report layouts, on EP2 IN (interrupt; free without the console). media_push queues a report (its ID first). */
+ #include "fm1_usb.h"   /* registers (chip/) */
+ #ifndef FELUCCA_CDC
+ #define FELUCCA_CDC 0
+@@ -36,6 +50,46 @@
+ #undef FELUCCA_UAC_48K
+ #define FELUCCA_UAC_48K 0
+ #endif
++#ifndef FELUCCA_HID
++#define FELUCCA_HID 0
++#endif
++#ifndef FELUCCA_HID_EP
++#define FELUCCA_HID_EP 4
++#endif
++#ifndef FELUCCA_HID_DEFAULT
++#define FELUCCA_HID_DEFAULT 1
++#endif
++#ifndef FELUCCA_HID_INTERVAL
++#define FELUCCA_HID_INTERVAL 1   /* ms between the host's IN tokens */
++#endif
++#if FELUCCA_HID && FELUCCA_HID_EP == 4 && FELUCCA_UAC
++#error "FELUCCA_HID_EP 4 is the audio input's endpoint"
++#endif
++#if FELUCCA_HID && FELUCCA_HID_EP == 2 && FELUCCA_CDC
++#error "FELUCCA_HID_EP 2 is the console's notify endpoint"
++#endif
++#if FELUCCA_HID && FELUCCA_HID_EP != 2 && FELUCCA_HID_EP != 4
++#error "FELUCCA_HID_EP is 2 or 4"
++#endif
++#ifndef FELUCCA_RAWHID
++#define FELUCCA_RAWHID 0
++#endif
++#ifndef FELUCCA_RAWHID_EP
++#define FELUCCA_RAWHID_EP 3
++#endif
++#if FELUCCA_RAWHID && (!FELUCCA_HID || FELUCCA_CDC)
++#error "FELUCCA_RAWHID needs FELUCCA_HID and no FELUCCA_CDC (EP3 is the console's)"
++#endif
++#if FELUCCA_RAWHID && FELUCCA_RAWHID_EP != 3
++#error "FELUCCA_RAWHID_EP is 3 (an endpoint with IN and OUT buffers, other than the keyboard's)"
++#endif
++#ifndef FELUCCA_MEDIA
++#define FELUCCA_MEDIA 0
++#endif
++#if FELUCCA_MEDIA && !FELUCCA_RAWHID
++#error "FELUCCA_MEDIA needs FELUCCA_RAWHID (its interface comes after the raw one, on EP2: no console)"
++#endif
++#define MEDIA_EP 2
+ enum { S_FADDR = 0, S_POWER = 1, S_INTRTX1 = 2, S_INTRTX2 = 3, S_INTRRX1 = 4, S_INTRRX2 = 5, S_INTRUSB = 6,
+        S_INTRTX1E = 7, S_INTRTX2E = 8, S_INTRRX1E = 9, S_INTRRX2E = 10, S_INTRUSBE = 11, S_FRAME1 = 12,
+        S_FRAME2 = 13, S_INDEX = 14,
+@@ -195,6 +249,47 @@
+     }
+ }
+ 
++#if FELUCCA_HID
++/* HID keyboard: a ring of 8-byte boot reports, main loop -> TIMER5 (one report per slot, the whole state of the
++ * keys: a full ring makes hid_push fail and the main loop tries again, it never drops a state) */
++#define HQ 16u
++static uint8_t hid_q[HQ][8];
++static volatile uint32_t hq_w, hq_r;
++static uint8_t hidtx[8] __attribute__((aligned(4)));
++static struct {
++    uint8_t cur[8];              /* the last report queued: GET_REPORT */
++    uint8_t idle;                /* SET_IDLE duration (4 ms units; 0 = only on change, all we do) */
++    uint8_t protocol;            /* SET_PROTOCOL: 0 boot, 1 report (the same 8 bytes either way) */
++    uint8_t e0_rx;               /* SET_REPORT: the LED byte follows */
++    volatile uint8_t leds;       /* host's LEDs: bit 0 Num, 1 Caps, 2 Scroll, 3 Compose, 4 Kana */
++    uint32_t tx_pkts, sets;      /* reports sent, LED reports received */
++} hid = {{0}, 0, 1, 0, 0, 0, 0};
++#endif
++
++#if FELUCCA_RAWHID
++/* raw HID: one 32-byte report held each way (request / reply, as VIA and Vial talk) */
++#define RAW_N 32u
++static uint8_t rawtx[RAW_N] __attribute__((aligned(4)));
++static uint8_t rawrx[64 + 4] __attribute__((aligned(4)));   /* the OUT DMA buffer (a packet may be up to 64) */
++static struct {
++    uint8_t in[RAW_N];           /* host -> device, waiting for raw_take */
++    uint8_t out[RAW_N];          /* device -> host, waiting for hid_tx's sibling raw_tx */
++    volatile uint8_t in_full, out_full;
++    uint8_t rx_pend;             /* EP3 OUT packet seen, not yet taken (in[] was full) */
++    uint8_t e0_rx;               /* SET_REPORT to the raw interface: the report follows on EP0 */
++    uint32_t rx_pkts, tx_pkts, e0_sets;
++} raw;
++#endif
++
++#if FELUCCA_MEDIA
++/* mouse / system / consumer reports: a ring, each up to 8 bytes with its length (report ID first) */
++#define MQN 16u
++static uint8_t media_q[MQN][8], media_qn[MQN];
++static volatile uint32_t mdq_w, mdq_r;
++static uint8_t mediatx[8] __attribute__((aligned(4)));
++static uint32_t media_tx_pkts;
++#endif
++
+ /* ------------------------------------------------------- descriptors --- */
+ /* Two functions: audio + MIDI (0 audio control, 1 MIDI streaming, 2 audio streaming with FELUCCA_UAC)
+  * and, with FELUCCA_CDC, the CDC-ACM console (communication + data). The endpoints never move:
+@@ -279,9 +374,10 @@
+     7, 5, 0x83, 2, 64, 0, 0,                               /* EP3 IN bulk */
+ #define CDC_LEN 66                                         /* with its IAD */
+ #define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
+-#define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
++#define D_DEVH(bcdusb, cls, sub, proto, cdc, hi, ser)                                                \
+     18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
+-    FELUCCA_USB_PID >> 8, BCD_LO(cdc), 0x03, 1, 2, 0, 1
++    FELUCCA_USB_PID >> 8, BCD_LO(cdc), (hi), 1, 2, (ser), 1
++#define D_DEV(bcdusb, cls, sub, proto, cdc) D_DEVH(bcdusb, cls, sub, proto, cdc, 0x03, 0)   /* 3.xx: no HID */
+ 
+ /* without the console (FELUCCA_CDC=0, or usb_cdc_on = 0): class 0, no IAD, as a plain USB-MIDI / audio device */
+ #define CFG_LEN_PLAIN (9 + AUD_LEN)
+@@ -327,24 +423,179 @@
+ #define AUD_IF 0u
+ #endif
+ #define UAC_AS_IF (AUD_IF + 2u)
++
++#if FELUCCA_HID
++/* The HID keyboard, after every other interface (so the others keep their numbers): interface, HID descriptor,
++ * interrupt IN endpoint. Report: the boot keyboard (HID 1.11 appendix B.1) with usages and logical maximum 255
++ * (2-byte items: 1-byte 0xFF would read as -1), so F13..F24 (0x68..0x73) and the rest of page 7 are valid
++ * (TinyUSB's TUD_HID_REPORT_DESC_KEYBOARD, the same bytes). */
++static const uint8_t HID_RD[] = {
++    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,                    /* Generic Desktop, Keyboard, Application */
++    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
++    0x95, 0x08, 0x75, 0x01, 0x81, 0x02,                    /* 8 modifier bits: Input (Data, Var, Abs) */
++    0x95, 0x01, 0x75, 0x08, 0x81, 0x01,                    /* reserved byte: Input (Const) */
++    0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x95, 0x05, 0x75, 0x01,
++    0x91, 0x02,                                            /* 5 LEDs: Output (Data, Var, Abs) */
++    0x95, 0x01, 0x75, 0x03, 0x91, 0x01,                    /* LED padding: Output (Const) */
++    0x05, 0x07, 0x19, 0x00, 0x2A, 0xFF, 0x00, 0x15, 0x00, 0x26, 0xFF, 0x00,
++    0x95, 0x06, 0x75, 0x08, 0x81, 0x00,                    /* 6 key codes: Input (Data, Array, Abs) */
++    0xC0,
++};
++#define HID_RD_LEN 65
++typedef char hid_rd_len_ok[sizeof HID_RD == HID_RD_LEN ? 1 : -1];
++#define D_HIDDESC 9, 0x21, 0x11, 0x01, 0, 1, 0x22, HID_RD_LEN & 0xFF, HID_RD_LEN >> 8   /* HID 1.11, 1 report desc. */
++#define D_HID(i)                                                                                     \
++    9, 4, (i), 0, 1, 3, 1, 1, 0,                           /* HID, boot subclass, keyboard */           \
++    D_HIDDESC,                                                                                       \
++    7, 5, 0x80 | FELUCCA_HID_EP, 3, 8, 0, FELUCCA_HID_INTERVAL,   /* interrupt IN, 8 bytes */
++#define HID_LEN 25
++static const uint8_t HID_DESC[9] = {D_HIDDESC};
++#if FELUCCA_RAWHID
++/* raw HID, as QMK's RAW_ENABLE presents it (VIA / Vial find it by usage page 0xFF60 and usage 0x61) */
++static const uint8_t RAW_RD[] = {
++    0x06, 0x60, 0xFF, 0x09, 0x61, 0xA1, 0x01,             /* Vendor 0xFF60, usage 0x61, Application */
++    0x09, 0x62, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x95, 0x20, 0x75, 0x08,
++    0x81, 0x02,                                            /* 32 bytes: Input (Data, Var, Abs) */
++    0x09, 0x63, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x95, 0x20, 0x75, 0x08,
++    0x91, 0x02,                                            /* 32 bytes: Output (Data, Var, Abs) */
++    0xC0,
++};
++#define RAW_RD_LEN 34
++typedef char raw_rd_len_ok[sizeof RAW_RD == RAW_RD_LEN ? 1 : -1];
++#define D_RAWDESC 9, 0x21, 0x11, 0x01, 0, 1, 0x22, RAW_RD_LEN, 0
++#define D_RAW(i)                                                                                     \
++    9, 4, (i), 0, 2, 3, 0, 0, 0,                           /* HID, no subclass, no protocol */          \
++    D_RAWDESC,                                                                                       \
++    7, 5, 0x80 | FELUCCA_RAWHID_EP, 3, RAW_N, 0, 1,        /* interrupt IN, 32 bytes, 1 ms */           \
++    7, 5, FELUCCA_RAWHID_EP, 3, RAW_N, 0, 1,               /* interrupt OUT */
++#define RAW_LEN 32
++#define RAW_NIF 1
++#define RAW_IF (AUD_NIF + 1u)                              /* after the keyboard (no console: no CDC) */
++static const uint8_t RAW_DESC[9] = {D_RAWDESC};
++#define IS_RAW_IF(itf) (USB_HID_ON && (itf) == RAW_IF)
++#else
++#define D_RAW(i)
++#define RAW_LEN 0
++#define RAW_NIF 0
++#endif
++#if FELUCCA_MEDIA
++/* mouse (ID 1), system control (ID 2), consumer control (ID 3): QMK's layouts (tmk_core report.h) */
++static const uint8_t MEDIA_RD[] = {
++    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00,   /* Mouse, ID 1, Pointer */
++    0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x00, 0x25, 0x01, 0x95, 0x08, 0x75, 0x01, 0x81, 0x02,   /* 8 buttons */
++    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03,
++    0x81, 0x06,                                                                /* X, Y, wheel: -127..127, Rel */
++    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,         /* AC Pan */
++    0xC0, 0xC0,
++    0x05, 0x01, 0x09, 0x80, 0xA1, 0x01, 0x85, 0x02, 0x19, 0x01, 0x2A, 0xB7, 0x00, 0x15, 0x01, 0x26,   /* System, ID 2 */
++    0xB7, 0x00, 0x95, 0x01, 0x75, 0x10, 0x81, 0x00, 0xC0,                      /* one 16-bit usage, Array */
++    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x19, 0x01, 0x2A, 0xA0, 0x02, 0x15, 0x01, 0x26,   /* Consumer, ID 3 */
++    0xA0, 0x02, 0x95, 0x01, 0x75, 0x10, 0x81, 0x00, 0xC0,
++};
++#define MEDIA_RD_LEN 113
++typedef char media_rd_len_ok[sizeof MEDIA_RD == MEDIA_RD_LEN ? 1 : -1];
++#define D_MEDIADESC 9, 0x21, 0x11, 0x01, 0, 1, 0x22, MEDIA_RD_LEN, 0
++#define D_MEDIA(i)                                                                                   \
++    9, 4, (i), 0, 1, 3, 0, 0, 0,                           /* HID, no boot */                           \
++    D_MEDIADESC,                                                                                     \
++    7, 5, 0x80 | MEDIA_EP, 3, 8, 0, 1,                     /* interrupt IN, 8 bytes, 1 ms */
++#define MEDIA_LEN 25
++#define MEDIA_NIF 1
++#define MEDIA_IF (AUD_NIF + 1u + RAW_NIF)
++static const uint8_t MEDIA_DESC[9] = {D_MEDIADESC};
++#define IS_MEDIA_IF(itf) (USB_HID_ON && (itf) == MEDIA_IF)
++#else
++#define D_MEDIA(i)
++#define MEDIA_LEN 0
++#define MEDIA_NIF 0
++#endif
++#ifdef FELUCCA_USB_SERIAL
++#define HID_SER 3                                          /* the serial number string (Vial: "vial:f64c2b3c") */
++#else
++#define HID_SER 0
++#endif
++static const uint8_t DEV_DESC_PLAIN_HID[18] = {D_DEVH(0x0110, 0, 0, 0, 0, 0x04, HID_SER)};
++static const uint8_t CFG_DESC_PLAIN_HID[] = {
++    D_CFG(CFG_LEN_PLAIN + HID_LEN + RAW_LEN + MEDIA_LEN, AUD_NIF + 1 + RAW_NIF + MEDIA_NIF),
++    D_AUDIO(0) D_HID(AUD_NIF) D_RAW(AUD_NIF + 1) D_MEDIA(AUD_NIF + 1 + RAW_NIF)};
++typedef char cfg_plain_hid_len_ok[sizeof CFG_DESC_PLAIN_HID == CFG_LEN_PLAIN + HID_LEN + RAW_LEN + MEDIA_LEN ? 1 : -1];
++#if FELUCCA_CDC
++#if FELUCCA_USB_LAYOUT == 2
++static const uint8_t DEV_DESC_HID[18] = {D_DEVH(0x0200, 0x00, 0x00, 0x01, 1, 0x04, HID_SER)};
++#elif FELUCCA_USB_LAYOUT == 3
++static const uint8_t DEV_DESC_HID[18] = {D_DEVH(0x0200, 0x00, 0x00, 0x00, 1, 0x04, HID_SER)};
++#else
++static const uint8_t DEV_DESC_HID[18] = {D_DEVH(0x0200, 0xEF, 0x02, 0x01, 1, 0x04, HID_SER)};   /* misc / IAD */
++#endif
++static const uint8_t CFG_DESC_HID[] = {
++    D_CFG(CFG_LEN + HID_LEN, USB_NIF + 1),
++#if FELUCCA_USB_LAYOUT == 1
++    D_CDC(CDC_IF_CDC)
++#endif
++    D_IAD(AUD_IF_CDC, AUD_NIF, 1, 1, 0),                  /* IAD: audio + MIDI */
++    D_AUDIO(AUD_IF_CDC)
++#if FELUCCA_USB_LAYOUT != 1
++    D_CDC(CDC_IF_CDC)
++#endif
++    D_HID(USB_NIF)
++};
++typedef char cfg_hid_len_ok[sizeof CFG_DESC_HID == CFG_LEN + HID_LEN ? 1 : -1];
++#define HID_IF (usb_cdc_on ? USB_NIF : AUD_NIF)
++#else
++#define DEV_DESC_HID DEV_DESC_PLAIN_HID
++#define CFG_DESC_HID CFG_DESC_PLAIN_HID
++#define HID_IF AUD_NIF
++#endif
++static uint8_t usb_hid_on = FELUCCA_HID_DEFAULT != 0;      /* the keyboard is presented (read by the TIMER5 ISR) */
++#define USB_HID_ON usb_hid_on
++#if FELUCCA_HID_EP == 4
++#define hid_ep_txbuf(p) fm1_usb_ep4_txbuf(p)
++#define hid_ep_send(p, n) fm1_usb_ep4_send((p), (n))
++#else
++#define hid_ep_txbuf(p) fm1_usb_ep_txbuf(FELUCCA_HID_EP, (p))
++#define hid_ep_send(p, n) fm1_usb_ep_send(FELUCCA_HID_EP, (p), (n))
++#endif
++#else
++#define USB_HID_ON 0
++#endif
+ static const uint8_t STR0[4] = {4, 3, 0x09, 0x04};
+ static const uint8_t STR1[] = {42, 3, 'H', 0, 0xFC, 0, 'g', 0, 'e', 0, 'l', 0, 't', 0, 'o', 0, 'n', 0, ' ', 0, 'I', 0,
+                                'n', 0, 's', 0, 't', 0, 'r', 0, 'u', 0, 'm', 0, 'e', 0, 'n', 0, 't', 0, 's', 0};
+ #ifdef FELUCCA_LOADER
+ static const uint8_t STR2[] = {30, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0, ' ', 0, 'U', 0, 'p', 0,
+                                'd', 0, 'a', 0, 't', 0, 'e', 0};
++#elif defined FELUCCA_USB_STR2
++static const uint8_t STR2[] = {FELUCCA_USB_STR2};          /* the app's product name (string descriptor bytes) */
+ #else
+ static const uint8_t STR2[] = {16, 3, 'F', 0, 'e', 0, 'l', 0, 'u', 0, 'c', 0, 'c', 0, 'a', 0};
+ #endif
+ 
++#if FELUCCA_HID && defined FELUCCA_USB_SERIAL
++static const uint8_t STR3[] = {FELUCCA_USB_SERIAL};        /* string descriptor bytes */
++#endif
++
+ static int get_desc(uint32_t wvalue, const uint8_t **d, uint16_t *l)
+ {
+     switch (wvalue >> 8) {
+     case 1:
++#if FELUCCA_HID
++        if (USB_HID_ON) {
++            *d = USB_CDC_ON ? DEV_DESC_HID : DEV_DESC_PLAIN_HID;
++            *l = 18;
++            return 1;
++        }
++#endif
+         *d = USB_CDC_ON ? DEV_DESC : DEV_DESC_PLAIN;
+         *l = 18;
+         return 1;
+     case 2:
++#if FELUCCA_HID
++        if (USB_HID_ON) {
++            *d = USB_CDC_ON ? CFG_DESC_HID : CFG_DESC_PLAIN_HID;
++            *l = (uint16_t)(USB_CDC_ON ? sizeof CFG_DESC_HID : sizeof CFG_DESC_PLAIN_HID);
++            return 1;
++        }
++#endif
+         *d = USB_CDC_ON ? CFG_DESC : CFG_DESC_PLAIN;
+         *l = (uint16_t)(USB_CDC_ON ? sizeof CFG_DESC : sizeof CFG_DESC_PLAIN);
+         return 1;
+@@ -362,6 +613,14 @@
+             *d = STR2;
+             *l = sizeof STR2;
+             return 1;
++#if FELUCCA_HID && defined FELUCCA_USB_SERIAL
++        case 3:                                         /* only the HID descriptors name it */
++            if (!USB_HID_ON)
++                return 0;
++            *d = STR3;
++            *l = sizeof STR3;
++            return 1;
++#endif
+         default:
+             return 0;
+         }
+@@ -487,6 +746,42 @@
+     fm1_usb_ep_enable(1u << 4);
+     uac_stream(0);
+ #endif
++#if FELUCCA_HID
++    if (usb_hid_on) {                                   /* interrupt IN: a bulk endpoint to MUSB (no ISO bit) */
++        hid_ep_txbuf(hidtx);
++        sie_wr(S_INDEX, FELUCCA_HID_EP);
++        sie_wr(S_TXMAXP, 0xFF);
++        sie_wr(S_TXCSR1, 0x48);                         /* ClrDataTog + FlushFIFO */
++        sie_wr(S_TXCSR2, 0);
++        fm1_usb_ep_enable(1u << FELUCCA_HID_EP);
++        hq_r = hq_w;                                    /* nothing stale: the app queues its state again */
++#if FELUCCA_RAWHID
++        fm1_usb_ep_txbuf(FELUCCA_RAWHID_EP, rawtx);     /* as the console's EP3 (interrupt = bulk to MUSB) */
++        fm1_usb_ep_rxbuf(FELUCCA_RAWHID_EP, rawrx);
++        sie_wr(S_INDEX, FELUCCA_RAWHID_EP);
++        sie_wr(S_TXMAXP, 0xFF);
++        sie_wr(S_TXCSR1, 0x48);
++        sie_wr(S_TXCSR2, 0);
++        sie_wr(S_RXMAXP, 0xFF);
++        sie_wr(S_RXCSR1, 0x90);
++        sie_wr(S_RXCSR2, 0);
++        sie_wr(S_INTRRX1E, 0x02 | 1u << FELUCCA_RAWHID_EP);
++        fm1_usb_ep_enable(1u << FELUCCA_RAWHID_EP);
++        raw.in_full = 0;
++        raw.out_full = 0;
++        raw.rx_pend = 1;                                /* look once: a packet may already wait */
++#endif
++#if FELUCCA_MEDIA
++        fm1_usb_ep_txbuf(MEDIA_EP, mediatx);
++        sie_wr(S_INDEX, MEDIA_EP);
++        sie_wr(S_TXMAXP, 0xFF);
++        sie_wr(S_TXCSR1, 0x48);                         /* ClrDataTog + FlushFIFO */
++        sie_wr(S_TXCSR2, 0);
++        fm1_usb_ep_enable(1u << MEDIA_EP);
++        mdq_r = mdq_w;
++#endif
++    }
++#endif
+ }
+ 
+ static void e0_chunk(void)
+@@ -541,6 +836,12 @@
+ #if FELUCCA_UAC
+         uac.e0_rx = 0;
+ #endif
++#if FELUCCA_HID
++        hid.e0_rx = 0;
++#endif
++#if FELUCCA_RAWHID
++        raw.e0_rx = 0;
++#endif
+         return;
+     }
+     if (csr & 0x10u) {                                  /* SetupEnd: the host abandoned the transfer */
+@@ -552,6 +853,12 @@
+ #if FELUCCA_UAC
+         uac.e0_rx = 0;
+ #endif
++#if FELUCCA_HID
++        hid.e0_rx = 0;
++#endif
++#if FELUCCA_RAWHID
++        raw.e0_rx = 0;
++#endif
+     }
+     if (usb.e0_tx) {
+         if (!(csr & 0x02u))
+@@ -579,6 +886,29 @@
+         goto ack;
+     }
+ #endif
++#if FELUCCA_HID
++    if (hid.e0_rx) {                                    /* SET_REPORT (output): the LED byte */
++        if (sie_rd(S_COUNT0) >= 1u)
++            hid.leds = ep0buf[0];
++        hid.sets++;
++        hid.e0_rx = 0;
++        goto ack;
++    }
++#endif
++#if FELUCCA_RAWHID
++    if (raw.e0_rx) {                                    /* SET_REPORT to the raw interface: a host write */
++        uint32_t n = sie_rd(S_COUNT0);
++        if (!raw.in_full) {                             /* (else dropped: the host waits for each reply) */
++            for (i = 0; i < RAW_N; i++)
++                raw.in[i] = i < n ? ep0buf[i] : 0;
++            RING_PUBLISH();
++            raw.in_full = 1;
++        }
++        raw.e0_sets++;
++        raw.e0_rx = 0;
++        goto ack;
++    }
++#endif
+     for (i = 0; i < 8u; i++)
+         s[i] = ep0buf[i];
+     usb.setups++;
+@@ -650,6 +980,30 @@
+         if (wvalue == 0 && s[4] == 0x84u)
+             goto ack;                                   /* isochronous: no halt, no toggle */
+ #endif
++#if FELUCCA_HID
++        if (wvalue == 0 && USB_HID_ON && s[4] == (0x80u | FELUCCA_HID_EP)) {
++            sie_wr(S_INDEX, FELUCCA_HID_EP);
++            sie_wr(S_TXCSR1, 0x40);                     /* ClrDataTog */
++            goto ack;
++        }
++#endif
++#if FELUCCA_MEDIA
++        if (wvalue == 0 && USB_HID_ON && s[4] == (0x80u | MEDIA_EP)) {
++            sie_wr(S_INDEX, MEDIA_EP);
++            sie_wr(S_TXCSR1, 0x40);
++            goto ack;
++        }
++#endif
++#if FELUCCA_RAWHID
++        if (wvalue == 0 && USB_HID_ON && (s[4] & 0x7Fu) == FELUCCA_RAWHID_EP) {
++            sie_wr(S_INDEX, FELUCCA_RAWHID_EP);
++            if (s[4] & 0x80u)
++                sie_wr(S_TXCSR1, 0x40);
++            else
++                sie_wr(S_RXCSR1, 0x80);
++            goto ack;
++        }
++#endif
+         if (wvalue != 0 || ep > last)
+             goto stall;                                 /* not an endpoint we have */
+         if (ep) {                                       /* (EP0 has no halt to clear) */
+@@ -661,6 +1015,111 @@
+         }
+         goto ack;
+     }
++#if FELUCCA_HID
++    /* HID (1.11 section 7): its class descriptors through a standard GET_DESCRIPTOR to the interface, and the
++     * class requests; anything for another interface stalls, as before */
++    case 0x8106:                                        /* GET_DESCRIPTOR, interface: HID 0x21, report 0x22 */
++#if FELUCCA_MEDIA
++        if (IS_MEDIA_IF(s[4])) {
++            if (s[3] == 0x22u)
++                e0_send(MEDIA_RD, sizeof MEDIA_RD, wlength);
++            else if (s[3] == 0x21u)
++                e0_send(MEDIA_DESC, sizeof MEDIA_DESC, wlength);
++            else
++                goto stall;
++            return;
++        }
++#endif
++#if FELUCCA_RAWHID
++        if (IS_RAW_IF(s[4])) {
++            if (s[3] == 0x22u)
++                e0_send(RAW_RD, sizeof RAW_RD, wlength);
++            else if (s[3] == 0x21u)
++                e0_send(RAW_DESC, sizeof RAW_DESC, wlength);
++            else
++                goto stall;
++            return;
++        }
++#endif
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        if (s[3] == 0x22u) {
++            e0_send(HID_RD, sizeof HID_RD, wlength);
++            return;
++        }
++        if (s[3] == 0x21u) {
++            e0_send(HID_DESC, sizeof HID_DESC, wlength);
++            return;
++        }
++        goto stall;
++    case 0x2109:                                        /* SET_REPORT: output (the LEDs), 1 byte follows */
++#if FELUCCA_RAWHID
++        if (IS_RAW_IF(s[4]) && wlength) {               /* raw: a host write through EP0 */
++            raw.e0_rx = 1;
++            sie_wr(S_INDEX, 0);
++            sie_wr(S_CSR0, 0x40);
++            return;
++        }
++#endif
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        if (wlength) {
++            hid.e0_rx = 1;
++            sie_wr(S_INDEX, 0);
++            sie_wr(S_CSR0, 0x40);                       /* ServicedRxPktRdy, no DataEnd yet */
++            return;
++        }
++        goto ack;
++    case 0x210A:                                        /* SET_IDLE: kept (we send on change only) */
++#if FELUCCA_MEDIA
++        if (IS_MEDIA_IF(s[4]))
++            goto ack;
++#endif
++#if FELUCCA_RAWHID
++        if (IS_RAW_IF(s[4]))
++            goto ack;                                   /* raw: replies only, nothing to repeat */
++#endif
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        hid.idle = s[3];
++        goto ack;
++    case 0x210B:                                        /* SET_PROTOCOL: boot and report are the same bytes */
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        hid.protocol = s[2] & 1u;
++        goto ack;
++    case 0xA101:                                        /* GET_REPORT: the keys now */
++#if FELUCCA_MEDIA
++        if (IS_MEDIA_IF(s[4])) {                        /* nothing pressed: the report ID, then zeros */
++            static uint8_t idle_rep[6];
++            uint32_t n = s[2] == 1u ? 6u : 3u;
++            idle_rep[0] = s[2];
++            e0_send(idle_rep, (uint16_t)n, wlength);
++            return;
++        }
++#endif
++#if FELUCCA_RAWHID
++        if (IS_RAW_IF(s[4])) {                          /* raw: zeros (replies go on the IN endpoint) */
++            static const uint8_t zero32[RAW_N];
++            e0_send(zero32, RAW_N, wlength);
++            return;
++        }
++#endif
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        e0_send(hid.cur, sizeof hid.cur, wlength);
++        return;
++    case 0xA102:                                        /* GET_IDLE */
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        e0_send(&hid.idle, 1, wlength);
++        return;
++    case 0xA103:                                        /* GET_PROTOCOL */
++        if (!USB_HID_ON || s[4] != HID_IF)
++            goto stall;
++        e0_send(&hid.protocol, 1, wlength);
++        return;
++#endif
+ #if FELUCCA_CDC
+     case 0x2120:                                        /* SET_LINE_CODING: 7 bytes follow */
+         if (!usb_cdc_on)
+@@ -941,6 +1400,175 @@
+     usb.tx_pkts++;
+ }
+ 
++#if FELUCCA_HID
++/* ---- the keyboard: the main loop queues (hid_push), TIMER5 sends (hid_tx), one report a packet ---- */
++static void hid_tx(void)                                /* as ep1_tx */
++{
++    uint32_t csr, i;
++    if (hq_r == hq_w)
++        return;
++    sie_wr(S_INDEX, FELUCCA_HID_EP);
++    csr = sie_rd(S_TXCSR1);
++    if (csr & 0x01u)
++        return;                                         /* the last report not taken yet */
++    if (csr & 0x80u)
++        sie_wr(S_TXCSR1, csr & ~0x80u);
++    RING_PUBLISH();                                     /* the slot after the index */
++    for (i = 0; i < 8u; i++)
++        hidtx[i] = hid_q[hq_r % HQ][i];
++    RING_PUBLISH();
++    hq_r++;
++    hid_ep_send(hidtx, 8u);
++    sie_wr(S_TXCSR1, sie_rd(S_TXCSR1) | 0x01u);
++    hid.tx_pkts++;
++}
++
++/* the keyboard can be used: presented, configured, the bus awake */
++static int hid_ready(void)
++{
++    return usb.up && usb_hid_on && usb.config && !usb.suspended;
++}
++
++/* reports the ring can still take */
++static uint32_t hid_room(void)
++{
++    return HQ - (hq_w - hq_r);
++}
++
++/* main loop: queue one report (r[0] modifiers, r[1] 0, r[2..7] key codes); 0: the ring is full, try again */
++static int hid_push(const uint8_t r[8])
++{
++    uint32_t i;
++    if (hq_w - hq_r >= HQ)
++        return 0;
++    for (i = 0; i < 8u; i++) {
++        hid_q[hq_w % HQ][i] = r[i];
++        hid.cur[i] = r[i];
++    }
++    RING_PUBLISH();
++    hq_w++;
++    return 1;
++}
++#endif
++
++#if FELUCCA_RAWHID
++/* ---- raw HID: TIMER5 receives into raw.in (NAK while it is full) and sends raw.out; the main loop takes and
++ * replies (raw_take, raw_send) ---- */
++static void raw_rx(void)                                /* as ep3_rx: leaves the packet (NAK) while in[] is full */
++{
++    uint32_t csr, n, i;
++    sie_wr(S_INDEX, FELUCCA_RAWHID_EP);
++    csr = sie_rd(S_RXCSR1) | (sie_rd(S_RXCSR2) << 8);
++    if (!(csr & 1u)) {
++        raw.rx_pend = 0;
++        return;
++    }
++    if (raw.in_full)
++        return;                                         /* rx_pend stays: retried next poll */
++    n = sie_rd(S_RXCOUNT1) | (sie_rd(S_RXCOUNT2) << 8);
++    if (n > 64u)
++        n = 64u;
++    raw.rx_pend = 0;
++    fm1_usb_rx_sync();
++    for (i = 0; i < RAW_N; i++)
++        raw.in[i] = i < n ? rawrx[i] : 0;
++    RING_PUBLISH();
++    raw.in_full = 1;
++    raw.rx_pkts++;
++    csr = (csr & ~0x164u) | 0x10u;
++    sie_wr(S_RXCSR1, csr & 0xFFu);
++    sie_wr(S_RXCSR2, csr >> 8);
++}
++
++static void raw_tx(void)                                /* as ep3_tx */
++{
++    uint32_t csr, i;
++    if (!raw.out_full)
++        return;
++    sie_wr(S_INDEX, FELUCCA_RAWHID_EP);
++    csr = sie_rd(S_TXCSR1);
++    if (csr & 0x01u)
++        return;
++    if (csr & 0x80u)
++        sie_wr(S_TXCSR1, csr & ~0x80u);
++    RING_PUBLISH();
++    for (i = 0; i < RAW_N; i++)
++        rawtx[i] = raw.out[i];
++    RING_PUBLISH();
++    raw.out_full = 0;
++    fm1_usb_ep_send(FELUCCA_RAWHID_EP, rawtx, RAW_N);
++    sie_wr(S_TXCSR1, sie_rd(S_TXCSR1) | 0x01u);
++    raw.tx_pkts++;
++}
++
++/* main loop: the host's next 32-byte report into r (1), or 0 */
++static int raw_take(uint8_t r[RAW_N])
++{
++    uint32_t i;
++    if (!raw.in_full)
++        return 0;
++    RING_PUBLISH();
++    for (i = 0; i < RAW_N; i++)
++        r[i] = raw.in[i];
++    RING_PUBLISH();
++    raw.in_full = 0;
++    return 1;
++}
++
++#if FELUCCA_MEDIA
++static void media_tx(void)                              /* as hid_tx */
++{
++    uint32_t csr, i, n;
++    if (mdq_r == mdq_w)
++        return;
++    sie_wr(S_INDEX, MEDIA_EP);
++    csr = sie_rd(S_TXCSR1);
++    if (csr & 0x01u)
++        return;
++    if (csr & 0x80u)
++        sie_wr(S_TXCSR1, csr & ~0x80u);
++    RING_PUBLISH();
++    n = media_qn[mdq_r % MQN];
++    for (i = 0; i < n; i++)
++        mediatx[i] = media_q[mdq_r % MQN][i];
++    RING_PUBLISH();
++    mdq_r++;
++    fm1_usb_ep_send(MEDIA_EP, mediatx, n);
++    sie_wr(S_TXCSR1, sie_rd(S_TXCSR1) | 0x01u);
++    media_tx_pkts++;
++}
++
++static uint32_t media_room(void) { return MQN - (mdq_w - mdq_r); }
++
++/* main loop: queue a mouse / system / consumer report (ID first, <= 8 bytes); 0: full */
++static int media_push(const uint8_t *r, uint32_t n)
++{
++    uint32_t i;
++    if (mdq_w - mdq_r >= MQN || n > 8u)
++        return 0;
++    for (i = 0; i < n; i++)
++        media_q[mdq_w % MQN][i] = r[i];
++    media_qn[mdq_w % MQN] = (uint8_t)n;
++    RING_PUBLISH();
++    mdq_w++;
++    return 1;
++}
++#endif
++
++/* main loop: queue a 32-byte report to the host; 0: the last one has not gone yet, try again */
++static int raw_send(const uint8_t r[RAW_N])
++{
++    uint32_t i;
++    if (raw.out_full)
++        return 0;
++    for (i = 0; i < RAW_N; i++)
++        raw.out[i] = r[i];
++    RING_PUBLISH();
++    raw.out_full = 1;
++    return 1;
++}
++#endif
++
+ #if FELUCCA_CDC
+ static void ep3_rx(void)                                /* leaves the packet (NAK) while the ring is full */
+ {
+@@ -1273,6 +1901,21 @@
+         uac_stream(0);
+         uac_rate_set(UAC_RATE);
+ #endif
++#if FELUCCA_HID
++        hid.e0_rx = 0;
++        hid.idle = 0;
++        hid.protocol = 1;                               /* HID 1.11 7.2.6: report protocol after a reset */
++        hq_r = hq_w;
++#endif
++#if FELUCCA_RAWHID
++        raw.e0_rx = 0;
++        raw.rx_pend = 0;
++        raw.in_full = 0;
++        raw.out_full = 0;
++#endif
++#if FELUCCA_MEDIA
++        mdq_r = mdq_w;
++#endif
+         fm1_usb_ep0_buf(ep0buf);
+         sie_wr(S_INTRUSBE, 0x07);
+         sie_wr(S_INTRTX1E, 0x01);
+@@ -1299,6 +1942,23 @@
+ #if FELUCCA_UAC
+     uac_service();
+ #endif
++#if FELUCCA_HID
++    if (usb.config && usb_hid_on)
++        hid_tx();
++#endif
++#if FELUCCA_MEDIA
++    if (usb.config && usb_hid_on)
++        media_tx();
++#endif
++#if FELUCCA_RAWHID
++    if (usb.config && usb_hid_on) {
++        if (ir & (1u << FELUCCA_RAWHID_EP))
++            raw.rx_pend = 1;
++        if (raw.rx_pend)                                /* not every poll: 3 SIE round trips each */
++            raw_rx();
++        raw_tx();
++    }
++#endif
+ }
+ 
+ static void usb_start(void)                             /* boot, or main-loop retry while usb.up == 0 */
+@@ -1357,3 +2017,29 @@
+     usb_cdc_on = (uint8_t)on;
+ }
+ #endif
++
++#if FELUCCA_HID
++/* Present the device with or without the keyboard, as usb_cdc_switch (at boot before usb_start, or later: the
++ * device drops off the bus and usb_retry attaches it again with the other descriptors). */
++static __attribute__((unused)) void usb_hid_switch(uint32_t on)
++{
++    on = on != 0;
++    if (on == usb_hid_on)
++        return;
++    if (usb.up) {
++        usb.up = 0;                                     /* usb_poll (TIMER5) stops before the SIE goes */
++        RING_PUBLISH();
++        fm1_usb_off();
++    }
++    usb.config = 0;
++    hq_r = hq_w;
++#if FELUCCA_RAWHID
++    raw.in_full = 0;
++    raw.out_full = 0;
++#endif
++#if FELUCCA_MEDIA
++    mdq_r = mdq_w;
++#endif
++    usb_hid_on = (uint8_t)on;
++}
++#endif
