@@ -1,6 +1,7 @@
 # fm1_keyboard: the FM-1 as a QMK-style USB keyboard configured with Vial.
 #   make fw        the firmware: build/fw-$(FLAVOR)/fm1kbd-$(FLAVOR).bin (JieLi toolchain, felucca-bsp in third_party/)
 #   make package   the installable package: build/fw-$(FLAVOR)/fm1kbd-$(FLAVOR).fwsc (+ felucca-bsp's update loader)
+#   make release   the release files: build/release/trireme-fm1-v$(VERSION).fwsc + the JieLi SDK's licence
 #   FLAVOR=raw (default): keyboard + raw HID (the VIA / Vial channel); FLAVOR=console: keyboard + USB serial console
 #   make test      host tests (tests/): the USB descriptors of every variant; kbcore.c (engine + Vial commands);
 #                  the screen and the editor; vial-gui's own protocol code against kbcore.c (only when refs/vial-gui
@@ -32,7 +33,7 @@ FW_OBJ  := $(FW)/crt0.o $(FW)/vec.o $(FW)/isr.o $(FW)/main.o
 SRC     := firmware/main.c firmware/usb.c firmware/lcd.c firmware/kbcore.c firmware/store.c firmware/gfx.c \
            firmware/ui.c firmware/editor.c firmware/font.h firmware/keycodes.h firmware/controls.h $(GEN)/vial_def.h
 
-.PHONY: fw package test patch screens font clean
+.PHONY: fw package release test patch screens font clean
 fw: $(FW)/$(NAME).bin
 
 $(GEN)/vial_def.h: firmware/vial.json tools/vialdef.py
@@ -67,6 +68,15 @@ AC79_SDK ?= $(HOME)/.jieli/ac79-sdk
 LDR     := build/loader
 
 package: $(FW)/$(NAME).fwsc
+
+VERSION := 0.1
+REL     := build/release
+release: $(FW)/$(NAME).fwsc
+	@test "$(FLAVOR)" = raw || { echo "releases are FLAVOR=raw"; exit 1; }
+	@mkdir -p $(REL)
+	cp $< $(REL)/trireme-fm1-v$(VERSION).fwsc
+	cp $(BSP)/LICENSES/Apache-2.0.txt $(REL)/LICENSE-Apache-2.0-JieLi-SDK.txt    # the package holds 3 SDK files
+	cd $(REL) && sha256sum trireme-fm1-v$(VERSION).fwsc > trireme-fm1-v$(VERSION).fwsc.sha256
 
 $(LDR)/loader.bin: $(BSP)/loader/* $(BSP)/chip/*
 	@mkdir -p $(@D)

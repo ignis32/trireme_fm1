@@ -35,12 +35,12 @@ Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard 
 1. **Install the stock V15 firmware first.** The FM-1 community's rule: always go back to stock V15 before
    installing a different custom firmware. Get it from M-VAVE (`FM-1.fwsc`) and install it with M-VAVE's updater or
    the installer below.
-2. Download `fm1kbd-raw.fwsc` from the [Releases](../../releases) page.
+2. Download the latest `trireme-fm1-v<version>.fwsc` from the [Releases](../../releases) page.
 3. Install it like any FM-1 firmware package. With felucca-bsp's installer (Python 3, `pip install mido
    python-rtmidi`; on Linux you may need `sudo` for MIDI access):
 
    ```sh
-   python3 fm1_install.py fm1kbd-raw.fwsc
+   python3 fm1_install.py trireme-fm1-v0.1.fwsc
    ```
 
    The installer is in this repository at `third_party/felucca-bsp/tools/fm1_install.py`.
@@ -178,6 +178,7 @@ git clone --recursive https://github.com/ignis32/trireme_fm1
 cd trireme_fm1
 third_party/felucca-bsp/tools/get_sdk.sh             # the SDK, into ~/.jieli/ac79-sdk
 make package TC=/path/to/jieli-linux-toolchains      # build/fw-raw/fm1kbd-raw.fwsc
+make release                                         # build/release/: trireme-fm1-v$(VERSION).fwsc + SDK licence
 make test                                            # the tests on the PC
 make screens                                         # the screen pictures as PNGs (needs Pillow)
 ```
