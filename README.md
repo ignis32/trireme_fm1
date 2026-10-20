@@ -44,7 +44,7 @@ Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard 
    python-rtmidi`; on Linux you may need `sudo` for MIDI access):
 
    ```sh
-   python3 fm1_install.py trireme-fm1-v0.1.fwsc
+   python3 fm1_install.py trireme-fm1-v0.1.1.fwsc
    ```
 
    The installer is in this repository at `third_party/felucca-bsp/tools/fm1_install.py`.
@@ -55,7 +55,7 @@ Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard 
    from this repository (needs the [GitHub CLI](https://cli.github.com)):
 
    ```sh
-   gh attestation verify trireme-fm1-v0.1.fwsc --repo ignis32/trireme_fm1 \
+   gh attestation verify trireme-fm1-v0.1.1.fwsc --repo ignis32/trireme_fm1 \
        --signer-workflow zvenson/fm1-build/.github/workflows/build.yml
    ```
 4. The FM-1 restarts as **FM-1 Keyboard**. The screen says `READY` when the computer has accepted it.

@@ -69,7 +69,7 @@ LDR     := build/loader
 
 package: $(FW)/$(NAME).fwsc
 
-VERSION := 0.1
+VERSION := 0.1.1
 REL     := build/release
 version:                                    # the release workflow checks the tag against it
 	@echo $(VERSION)
