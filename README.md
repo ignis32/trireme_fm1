@@ -48,6 +48,16 @@ Custom firmware that turns the **M-VAVE FM-1** into a programmable USB keyboard 
    ```
 
    The installer is in this repository at `third_party/felucca-bsp/tools/fm1_install.py`.
+
+   Release packages are built on GitHub from the tagged source by
+   [The Firmware Hub's shared workflow](https://github.com/zvenson/fm1-build), which signs a build attestation
+   ([provenance](https://thefirmwarehub.com/kb/#provenance)). To check that a package is exactly the one built
+   from this repository (needs the [GitHub CLI](https://cli.github.com)):
+
+   ```sh
+   gh attestation verify trireme-fm1-v0.1.fwsc --repo ignis32/trireme_fm1 \
+       --signer-workflow zvenson/fm1-build/.github/workflows/build.yml
+   ```
 4. The FM-1 restarts as **FM-1 Keyboard**. The screen says `READY` when the computer has accepted it.
 
 ### Going back to stock
@@ -176,7 +186,7 @@ kept as it is.
 You need Linux (or WSL), `make`, GCC (for the PC tests), Python 3, and:
 
 - **The JieLi Linux toolchain**: [jieli-linux-toolchains](https://pkgman.jieliapp.com/s/linux-toolchain)
-  (tested with 20250324.1). Unpack it; `TC` is the directory with `pi32v2/` and `common/` in it.
+  (tested with 20250324.1 and 20260730.1: both give the same package). Unpack it; `TC` is the directory with `pi32v2/` and `common/` in it.
 - **The JieLi AC79 SDK** (Apache-2.0), only for building the package: felucca-bsp's `tools/get_sdk.sh` fetches the
   tested revision into `~/.jieli/ac79-sdk`.
 
@@ -199,6 +209,13 @@ Put `TC := ...` and `AC79_SDK := ...` in a `local.mk` file to avoid typing them.
 vial-gui's own protocol code.
 
 `FLAVOR=console` builds a variant with a USB serial console instead of Vial, for development.
+
+### Releases
+
+Releases are never built or uploaded by hand. Set `VERSION` in the Makefile, commit, and push the tag `v$(VERSION)`:
+`.github/workflows/release.yml` hands the build to [zvenson/fm1-build](https://github.com/zvenson/fm1-build) `@v1`,
+which runs `make release` and `make test`, attests the files in `build/release/` and publishes them as the tag's
+release. Running the workflow by hand (Actions → release → Run workflow) builds and attests without releasing.
 
 ### Layout
 

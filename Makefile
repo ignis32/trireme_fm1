@@ -33,7 +33,7 @@ FW_OBJ  := $(FW)/crt0.o $(FW)/vec.o $(FW)/isr.o $(FW)/main.o
 SRC     := firmware/main.c firmware/usb.c firmware/lcd.c firmware/kbcore.c firmware/store.c firmware/gfx.c \
            firmware/ui.c firmware/editor.c firmware/font.h firmware/keycodes.h firmware/controls.h $(GEN)/vial_def.h
 
-.PHONY: fw package release test patch screens font clean
+.PHONY: fw package version release test patch screens font clean
 fw: $(FW)/$(NAME).bin
 
 $(GEN)/vial_def.h: firmware/vial.json tools/vialdef.py
@@ -71,6 +71,8 @@ package: $(FW)/$(NAME).fwsc
 
 VERSION := 0.1
 REL     := build/release
+version:                                    # the release workflow checks the tag against it
+	@echo $(VERSION)
 release: $(FW)/$(NAME).fwsc
 	@test "$(FLAVOR)" = raw || { echo "releases are FLAVOR=raw"; exit 1; }
 	@mkdir -p $(REL)
